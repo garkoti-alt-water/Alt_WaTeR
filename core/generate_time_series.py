@@ -157,7 +157,7 @@ def generate_altimetry_timeseries(
     # --------------------------------------------------
     # CLASS LOGIC
     # --------------------------------------------------
-    buffer_m = -100 if reservoir_class in [1, 2] else 0
+    buffer_m = -300 if reservoir_class in [1, 2] else 0
     use_s1 = reservoir_class not in [1, 2]
 
     buffered_max = buffer_gdf(max_gdf, buffer_m)
