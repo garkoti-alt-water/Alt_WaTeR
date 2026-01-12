@@ -1,5 +1,6 @@
 import os
 import ee
+import geopandas as gpd
 
 from .water_masks import water_masks
 from .classification import run_full_classification
@@ -7,10 +8,7 @@ from .generate_time_series import generate_altimetry_timeseries
 
 
 def run_reservoir_analysis(
-    min_lon: float,
-    min_lat: float,
-    max_lon: float,
-    max_lat: float,
+    aoi_gdf: gpd.GeoDataFrame,
     altimetry_folder: str,
     output_csv: str,
     occurrence_threshold: int = 90,
@@ -18,68 +16,84 @@ def run_reservoir_analysis(
     """
     End-to-end reservoir analysis pipeline.
 
-    Returns
-    -------
-    dict with:
-        - reservoir_class : int
-        - output_csv : str
-        - timeseries : pandas.DataFrame
-        - map_fig : matplotlib.figure.Figure
-        - ts_fig : matplotlib.figure.Figure
-        - perm_gdf : geopandas.GeoDataFrame
-        - max_gdf : geopandas.GeoDataFrame
+    Parameters
+    ----------
+    aoi_gdf : GeoDataFrame
+        Area of interest (polygon or multipolygon, EPSG:4326)
+    altimetry_folder : str
+        Folder containing altimetry NetCDF files
+    output_csv : str
+        Output CSV path
+    occurrence_threshold : int
+        GSW occurrence threshold for permanent water
     """
 
     # --------------------------------------------------
-    # Safety checks
+    # Earth Engine initialization
     # --------------------------------------------------
-    if not ee.data._credentials:
-        raise RuntimeError(
-            "Earth Engine not initialized. Run ee.Authenticate() and ee.Initialize() first."
-        )
+    try:
+        ee.Initialize()
+    except Exception:
+        ee.Authenticate()
+        ee.Initialize()
 
+    # --------------------------------------------------
+    # Sanity checks
+    # --------------------------------------------------
+    if aoi_gdf.empty:
+        raise ValueError("AOI GeoDataFrame is empty")
+
+    if aoi_gdf.crs is None:
+        raise ValueError("AOI GeoDataFrame has no CRS")
+
+    if aoi_gdf.crs.to_string() != "EPSG:4326":
+        aoi_gdf = aoi_gdf.to_crs("EPSG:4326")
+
+    # --------------------------------------------------
+    # Output directory
+    # --------------------------------------------------
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
 
     # --------------------------------------------------
-    # STEP 1: Water masks
+    # STEP 1: Water masks (AOI-BASED)
     # --------------------------------------------------
     perm_gdf, max_gdf = water_masks(
-        min_lon=min_lon,
-        min_lat=min_lat,
-        max_lon=max_lon,
-        max_lat=max_lat,
+        aoi_gdf=aoi_gdf,
         occurrence_threshold=occurrence_threshold,
         plot=False,
     )
 
+    if perm_gdf.empty or max_gdf.empty:
+        raise RuntimeError("Water mask extraction failed (empty result)")
+
     # --------------------------------------------------
     # STEP 2: Reservoir classification
     # --------------------------------------------------
-    reservoir_class, _ = run_full_classification(
+    reservoir_class, class_metrics = run_full_classification(
         base_folder=altimetry_folder,
         max_water_input=max_gdf,
         perm_water_input=perm_gdf,
     )
 
     # --------------------------------------------------
-    # STEP 3: Generate time series + figures
+    # STEP 3: Generate altimetry time series
     # --------------------------------------------------
     ts_df = generate_altimetry_timeseries(
         nc_folder=altimetry_folder,
         max_gdf=max_gdf,
         reservoir_class=reservoir_class,
-        output_csv=output_csv
+        output_csv=output_csv,
     )
 
-
     # --------------------------------------------------
-    # Return EVERYTHING needed by GUI
+    # Return results
     # --------------------------------------------------
     return {
         "reservoir_class": reservoir_class,
+        "classification_metrics": class_metrics,
         "output_csv": output_csv,
         "timeseries": ts_df,
         "perm_gdf": perm_gdf,
         "max_gdf": max_gdf,
+        "aoi_gdf": aoi_gdf,
     }
-

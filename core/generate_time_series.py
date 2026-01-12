@@ -3,17 +3,25 @@ def generate_altimetry_timeseries(
     max_gdf,
     reservoir_class,
     output_csv,
-    class_color=None,
     s1_search_days=90,
-    make_plots=True,
 ):
     """
-    Generate reservoir water level time series using
-    Sentinel-1 VV/IW + nearest-date + Otsu water masking.
+    Generate reservoir water level time series using:
+    - Direct altimetry for Classes 1A/1B/2A/2B
+    - Sentinel-1 VV/IW + nearest-date + Otsu masking for Classes 3A–4B
+
+    Logic:
+      1. Filter points inside maximum water extent
+         - Class 1–2 → negative buffer (−300 m)
+         - Class 3–4 → no buffer
+      2. If Class 3–4 → apply Sentinel-1 masking
+      3. Compute per-pass median elevation
+      4. Apply global MAD filter (threshold = 2.0)
+      5. Apply rolling time-based IQR filter (90D, multiplier = 1.0)
     """
 
     # --------------------------------------------------
-    # Imports (local)
+    # Imports
     # --------------------------------------------------
     import os, glob
     import numpy as np
@@ -26,29 +34,22 @@ def generate_altimetry_timeseries(
     from .altimetry_extractors import extract_altimetry_data
 
     # --------------------------------------------------
-    # OUTLIER FILTER UTILITIES
+    # CLASS PARSER (STRICT)
     # --------------------------------------------------
-    def mad_outlier_removal(df, column, threshold=3.5):
-        if df.empty:
-            return df
-        data = df[column]
-        median = data.median()
-        mad = np.median(np.abs(data - median))
-        if mad == 0:
-            return df
-        modified_z = 0.6745 * (data - median) / mad
-        return df[np.abs(modified_z) <= threshold]
+    def parse_reservoir_class(res_class):
+        if res_class is None:
+            raise ValueError("reservoir_class cannot be None")
+        if not isinstance(res_class, str) or len(res_class) != 2:
+            raise ValueError(f"Invalid reservoir_class: {res_class}")
+        return int(res_class[0]), res_class[1]
 
-    def rolling_iqr_outlier_removal(df, column, window="90D", k=1.0):
-        if df.empty:
-            return df
-        Q1 = df[column].rolling(window, center=True, min_periods=3).quantile(0.25)
-        Q3 = df[column].rolling(window, center=True, min_periods=3).quantile(0.75)
-        IQR = Q3 - Q1
-        return df[(df[column] >= Q1 - k * IQR) & (df[column] <= Q3 + k * IQR)]
+    base_class, terrain_flag = parse_reservoir_class(reservoir_class)
+
+    use_s1 = base_class in [3, 4]
+    buffer_m = -300 if base_class in [1, 2] else 0
 
     # --------------------------------------------------
-    # INTERNAL HELPERS
+    # HELPERS
     # --------------------------------------------------
     def buffer_gdf(gdf, buffer_m):
         g = gdf.to_crs(3857)
@@ -56,34 +57,84 @@ def generate_altimetry_timeseries(
         g = g[~g.is_empty]
         return g.to_crs(4326)
 
-    def compute_median_point(df):
+    # -------- GLOBAL MAD FILTER --------
+    def mad_outlier_removal(df, column, threshold=2.0):
         if df.empty:
+            return df
+        med = df[column].median()
+        mad = np.median(np.abs(df[column] - med))
+        if mad == 0:
+            return df
+        z = 0.6745 * (df[column] - med) / mad
+        return df[np.abs(z) <= threshold]
+
+    # -------- TIME-BASED ROLLING IQR --------
+    def rolling_iqr_outlier_removal(
+        df,
+        column,
+        time_window="90D",
+        threshold_multiplier=1.0,
+    ):
+        if df.empty:
+            return df
+
+        Q1 = df[column].rolling(
+            window=time_window, center=True, min_periods=3
+        ).quantile(0.25)
+
+        Q3 = df[column].rolling(
+            window=time_window, center=True, min_periods=3
+        ).quantile(0.75)
+
+        IQR = Q3 - Q1
+        lower = Q1 - threshold_multiplier * IQR
+        upper = Q3 + threshold_multiplier * IQR
+
+        mask = (df[column] >= lower) & (df[column] <= upper)
+        return df[mask]
+
+    # --------------------------------------------------
+    # MEDIAN POINT COMPUTATION (PER PASS)
+    # --------------------------------------------------
+    def compute_median_point(df):
+        if df.empty or "range" not in df.columns:
             return None
 
-        for col in ["iono","dry","wet","pole","solid","geoid","load_tide"]:
+        df = df.copy()
+
+        for col in ["iono", "dry", "wet", "pole", "solid", "geoid", "load_tide"]:
             if col not in df.columns:
                 df[col] = 0.0
             df[col] = df[col].fillna(0.0)
 
-        is_s3 = "S3" in str(df["mission"].iloc[0])
+        df["range"] = df["range"].fillna(0.0)
 
-        elev = np.where(
-            is_s3,
-            df["altitude"] - (
-                df["range"] + df["dry"] + df["wet"] +
-                df["pole"] + df["solid"] +
-                df["iono"] + df["load_tide"]
-            ) - df["geoid"],
-            df["altitude"] - (
-                df["range"] + df["dry"] + df["wet"] +
-                df["pole"] + df["solid"] +
-                df["iono"]
-            ) - df["geoid"]
-        )
+        mission = str(df["mission"].iloc[0])
+        is_s3 = "S3" in mission or "Sentinel" in mission
 
-        df = df.copy()
+        if is_s3:
+            elev = (
+                df["altitude"]
+                - (
+                    df["range"]
+                    + df["dry"] + df["wet"] + df["pole"]
+                    + df["solid"] + df["iono"] + df["load_tide"]
+                )
+                - df["geoid"]
+            )
+        else:
+            elev = (
+                df["altitude"]
+                - (
+                    df["range"]
+                    + df["dry"] + df["wet"]
+                    + df["pole"] + df["solid"] + df["iono"]
+                )
+                - df["geoid"]
+            )
+
         df["elevation"] = elev
-        df = df.dropna(subset=["elevation","latitude","longitude","date"])
+        df = df.dropna(subset=["elevation", "latitude", "longitude", "date"])
         if df.empty:
             return None
 
@@ -100,7 +151,7 @@ def generate_altimetry_timeseries(
         }
 
     # --------------------------------------------------
-    # SENTINEL-1 NEAREST-DATE + OTSU MASK
+    # SENTINEL-1 MASK
     # --------------------------------------------------
     def sentinel1_mask(region_ee, target_date):
         coll = (
@@ -122,52 +173,42 @@ def generate_altimetry_timeseries(
             return None
 
         imgs = coll.toList(coll.size()).getInfo()
-        times = [i["properties"]["system:time_start"] for i in imgs]
-        idx = int(np.argmin([
-            abs(t - target_date.timestamp() * 1000) for t in times
-        ]))
-
+        times = np.array([i["properties"]["system:time_start"] for i in imgs])
+        idx = np.argmin(np.abs(times - target_date.timestamp() * 1000))
         nearest = datetime.fromtimestamp(times[idx] / 1000, tz=UTC)
 
         img = (
             coll
-            .filterDate(
-                nearest.strftime("%Y-%m-%d"),
-                (nearest + timedelta(days=1)).strftime("%Y-%m-%d")
-            )
+            .filterDate(nearest.strftime("%Y-%m-%d"),
+                        (nearest + timedelta(days=1)).strftime("%Y-%m-%d"))
             .mosaic()
             .focal_median(1)
         )
 
-        arr = np.array(
-            img.sampleRectangle(region=region_ee).get("VV").getInfo()
-        )
+        arr = np.array(img.sampleRectangle(region=region_ee).get("VV").getInfo())
         arr = arr[np.isfinite(arr)]
         if arr.size == 0:
             return None
 
-        thr = threshold_otsu(arr)
-        return img.lt(thr)
+        return img.lt(threshold_otsu(arr))
 
     # --------------------------------------------------
     # INITIALIZE EE
     # --------------------------------------------------
-    ee.Initialize()
-
-    # --------------------------------------------------
-    # CLASS LOGIC
-    # --------------------------------------------------
-    buffer_m = -300 if reservoir_class in [1, 2] else 0
-    use_s1 = reservoir_class not in [1, 2]
+    try:
+        ee.Initialize()
+    except Exception:
+        ee.Authenticate()
+        ee.Initialize()
 
     buffered_max = buffer_gdf(max_gdf, buffer_m)
     max_union = buffered_max.geometry.union_all()
     region_ee = geemap.geopandas_to_ee(buffered_max)
 
     # --------------------------------------------------
-    # MAIN LOOP
+    # MAIN LOOP (PER PASS)
     # --------------------------------------------------
-    results = []
+    records = []
 
     for nc in sorted(glob.glob(os.path.join(nc_folder, "**/*.nc"), recursive=True)):
         try:
@@ -175,7 +216,8 @@ def generate_altimetry_timeseries(
         except Exception:
             continue
 
-        if not {"latitude","longitude","date"}.issubset(df.columns):
+        required = {"latitude", "longitude", "date", "mission", "altitude"}
+        if not required.issubset(df.columns):
             continue
 
         gdf = gpd.GeoDataFrame(
@@ -184,14 +226,17 @@ def generate_altimetry_timeseries(
             crs="EPSG:4326"
         )
 
+        # --- STEP 1: Max-extent filtering ---
         gdf = gdf[gdf.geometry.within(max_union)]
         if gdf.empty:
             continue
 
-        if not use_s1:
-            rep = compute_median_point(gdf.drop(columns="geometry"))
-        else:
-            mask = sentinel1_mask(region_ee, pd.to_datetime(df["date"].iloc[0]))
+        # --- STEP 2: Sentinel-1 masking (Class 3–4 only) ---
+        if use_s1:
+            mask = sentinel1_mask(
+                region_ee,
+                pd.to_datetime(gdf["date"].iloc[0])
+            )
             if mask is None:
                 continue
 
@@ -200,40 +245,51 @@ def generate_altimetry_timeseries(
                 scale=30,
                 geometries=True
             )
-
             if fc.size().getInfo() == 0:
                 continue
 
             sampled = geemap.ee_to_gdf(fc)
-
-            # 🔑 KEEP ONLY WATER POINTS
             band = next(
-                (c for c in sampled.columns if c not in ("geometry","system:index","id")),
+                (c for c in sampled.columns
+                 if c not in ("geometry", "system:index", "id")),
                 None
             )
             if band is None:
                 continue
 
-            water = sampled[sampled[band].astype(bool)]
-            if water.empty:
+            gdf = sampled[sampled[band].astype(bool)]
+            if gdf.empty:
                 continue
 
-            rep = compute_median_point(water.drop(columns="geometry"))
-
+        # --- STEP 3: Per-pass median ---
+        rep = compute_median_point(gdf.drop(columns="geometry"))
         if rep:
-            results.append(rep)
+            records.append(rep)
 
-    # --------------------------------------------------
-    # FINAL OUTPUT
-    # --------------------------------------------------
-    if not results:
+    if not records:
         raise RuntimeError("No valid time-series points produced.")
 
-    ts = pd.DataFrame(results).sort_values("date").drop_duplicates("date")
+    # --------------------------------------------------
+    # FINAL TIME SERIES + FILTERING
+    # --------------------------------------------------
+    ts = (
+        pd.DataFrame(records)
+        .drop_duplicates("date")
+        .sort_values("date")
+        .set_index("date")
+    )
 
-    ts = mad_outlier_removal(ts, "elevation")
-    ts = rolling_iqr_outlier_removal(ts, "elevation", window=5)
+    # --- Global MAD ---
+    ts = mad_outlier_removal(ts, column="elevation", threshold=2.0)
 
+    # --- Rolling IQR (time-based) ---
+    ts = rolling_iqr_outlier_removal(
+        ts,
+        column="elevation",
+        time_window="90D",
+        threshold_multiplier=1.0
+    )
 
+    ts = ts.reset_index()
     ts.to_csv(output_csv, index=False, float_format="%.3f")
     return ts

@@ -26,62 +26,24 @@ def merge_and_fill(gdf):
 
     return gpd.GeoDataFrame(geometry=[geom], crs=gdf.crs)
 
-import ee
-import geemap
-
-# ----------------------------------------------------
-# STEP 1: Authenticate Google Earth Engine
-# ----------------------------------------------------
-# This will open a browser window (or show a link in Colab)
-# where the user must:
-#   1. Log in with their Google account
-#   2. Grant Earth Engine permissions
-#   3. Copy the authorization code
-#   4. Paste it back into the prompt
-#
-# NOTE:
-# - This step is REQUIRED only the first time
-# - After successful authentication, credentials
-#   are saved locally and reused automatically
-#
-ee.Authenticate()
-
-# ----------------------------------------------------
-# STEP 2: Initialize Earth Engine
-# ----------------------------------------------------
-# Initializes the Earth Engine API using the authenticated
-# user account.
-#
-# No project ID is required for most use cases.
-# If the user has a registered GEE Cloud Project,
-# it can be added as:
-# ee.Initialize(project='your-project-id')
-#
-ee.Initialize()
-
-
 
 # --------------------------------------------------
-# Main function
+# MAIN FUNCTION (UPDATED)
 # --------------------------------------------------
 def water_masks(
-    min_lon,
-    min_lat,
-    max_lon,
-    max_lat,
-    occurrence_threshold=90,
-    scale=30,
-    plot=True,
+    aoi_gdf: gpd.GeoDataFrame,
+    occurrence_threshold: int = 90,
+    scale: int = 30,
+    plot: bool = True,
 ):
     """
-    Identify a reservoir using HydroLAKES and extract
-    permanent water and maximum water extent masks
-    from JRC Global Surface Water (GSW), using a bounding box.
+    Extract permanent water and maximum water extent masks
+    from JRC Global Surface Water (GSW), using a polygon AOI.
 
     Parameters
     ----------
-    min_lon, min_lat, max_lon, max_lat : float
-        Bounding box coordinates
+    aoi_gdf : geopandas.GeoDataFrame
+        Area of interest (Polygon or MultiPolygon, EPSG:4326)
     occurrence_threshold : int
         Permanent water occurrence threshold (%)
     scale : int
@@ -98,37 +60,33 @@ def water_masks(
     """
 
     # --------------------------------------------------
-    # 1. AOI geometry (bounding box)
+    # Earth Engine init (safe)
     # --------------------------------------------------
-    aoi = ee.Geometry.Polygon([[
-        [min_lon, min_lat],
-        [max_lon, min_lat],
-        [max_lon, max_lat],
-        [min_lon, max_lat],
-        [min_lon, min_lat],
-    ]])
+    try:
+        ee.Initialize()
+    except Exception:
+        ee.Authenticate()
+        ee.Initialize()
 
     # --------------------------------------------------
-    # 2. Load HydroLAKES
+    # AOI validation
     # --------------------------------------------------
-    hydrolakes = ee.FeatureCollection(
-        "projects/sat-io/open-datasets/HydroLAKES"
-    )
+    if aoi_gdf.empty:
+        raise ValueError("AOI GeoDataFrame is empty")
 
-    lakes = hydrolakes.filterBounds(aoi)
+    if aoi_gdf.crs is None:
+        raise ValueError("AOI GeoDataFrame has no CRS")
 
-    if lakes.size().getInfo() == 0:
-        raise ValueError("No HydroLAKES reservoir found inside bounding box.")
-
-    # Select largest reservoir intersecting AOI
-    reservoir = ee.Feature(
-        lakes.sort("Lake_area", False).first()
-    )
-
-    geom = reservoir.geometry()
+    if aoi_gdf.crs.to_string() != "EPSG:4326":
+        aoi_gdf = aoi_gdf.to_crs("EPSG:4326")
 
     # --------------------------------------------------
-    # 3. Global Surface Water masks (CRITICAL: selfMask)
+    # Convert AOI to Earth Engine geometry
+    # --------------------------------------------------
+    aoi_ee = geemap.geopandas_to_ee(aoi_gdf)
+
+    # --------------------------------------------------
+    # Global Surface Water (GSW)
     # --------------------------------------------------
     gsw = ee.Image("JRC/GSW1_4/GlobalSurfaceWater")
 
@@ -136,21 +94,21 @@ def water_masks(
         gsw.select("occurrence")
         .gte(occurrence_threshold)
         .selfMask()
-        .clip(geom)
+        .clip(aoi_ee)
     )
 
     max_mask = (
         gsw.select("max_extent")
         .eq(1)
         .selfMask()
-        .clip(geom)
+        .clip(aoi_ee)
     )
 
     # --------------------------------------------------
-    # 4. Raster → Vector
+    # Raster → Vector
     # --------------------------------------------------
     perm_fc = perm_mask.reduceToVectors(
-        geometry=geom,
+        geometry=aoi_ee,
         scale=scale,
         geometryType="polygon",
         eightConnected=True,
@@ -158,7 +116,7 @@ def water_masks(
     )
 
     max_fc = max_mask.reduceToVectors(
-        geometry=geom,
+        geometry=aoi_ee,
         scale=scale,
         geometryType="polygon",
         eightConnected=True,
@@ -166,35 +124,42 @@ def water_masks(
     )
 
     # --------------------------------------------------
-    # 5. Convert to GeoDataFrame
+    # Convert to GeoDataFrame
     # --------------------------------------------------
-    perm_gdf = geemap.ee_to_gdf(perm_fc).set_crs("EPSG:4326")
-    max_gdf = geemap.ee_to_gdf(max_fc).set_crs("EPSG:4326")
+    perm_gdf = geemap.ee_to_gdf(perm_fc)
+    max_gdf  = geemap.ee_to_gdf(max_fc)
+
+    if perm_gdf.empty or max_gdf.empty:
+        raise RuntimeError("GSW returned empty water masks")
+
+    perm_gdf = perm_gdf.set_crs("EPSG:4326")
+    max_gdf  = max_gdf.set_crs("EPSG:4326")
 
     # --------------------------------------------------
-    # 6. Merge polygons & remove holes
+    # Merge polygons & remove holes
     # --------------------------------------------------
     perm_gdf = merge_and_fill(perm_gdf)
-    max_gdf = merge_and_fill(max_gdf)
+    max_gdf  = merge_and_fill(max_gdf)
 
     # --------------------------------------------------
-    # 7. Plot
+    # Plot
     # --------------------------------------------------
     if plot:
         fig, ax = plt.subplots(figsize=(5, 5))
 
-        max_gdf.plot(ax=ax, color="lightblue", edgecolor="blue", alpha=0.4)
-        perm_gdf.plot(ax=ax,facecolor="none",edgecolor="navy", linewidth=1)
+        max_gdf.plot(ax=ax, color="lightblue", edgecolor="blue", alpha=0.5)
+        perm_gdf.plot(ax=ax, facecolor="none", edgecolor="navy", linewidth=1.2)
 
         legend_elements = [
             Patch(facecolor="lightblue", edgecolor="black", label="Maximum water extent"),
-            Patch(facecolor="blue", edgecolor="black", label="Permanent water"),
+            Patch(facecolor="none", edgecolor="navy", label="Permanent water"),
         ]
 
-        ax.legend(handles=legend_elements, loc="best", frameon=True,fontsize=9)
+        ax.legend(handles=legend_elements, fontsize=9, loc="best")
         ax.set_xlabel("Longitude")
         ax.set_ylabel("Latitude")
         ax.set_title("GSW reservoir water masks")
+        ax.grid(alpha=0.3)
 
         plt.show()
 
