@@ -53,8 +53,8 @@ def get_class_color(reservoir_class):
 # Page setup
 # -------------------------------------------------
 st.set_page_config(layout="centered")
-st.title("Alt-WaTER")
-st.caption("Water level Time series Estimation using satellite Altimetry")
+st.title("Alt-WaTeR")
+st.caption("Water level Time series generation using satellite Altimetry")
 st.markdown("---")
 
 # -------------------------------------------------
