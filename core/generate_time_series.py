@@ -6,18 +6,7 @@ def generate_altimetry_timeseries(
     s1_search_days=90,
 ):
     """
-    Generate reservoir water level time series using:
-    - Direct altimetry for Classes 1A/1B/2A/2B
-    - Sentinel-1 VV/IW + nearest-date + Otsu masking for Classes 3A–4B
-
-    Logic:
-      1. Filter points inside maximum water extent
-         - Class 1–2 → negative buffer (−300 m)
-         - Class 3–4 → no buffer
-      2. If Class 3–4 → apply Sentinel-1 masking
-      3. Compute per-pass median elevation
-      4. Apply global MAD filter (threshold = 2.0)
-      5. Apply rolling time-based IQR filter (90D, multiplier = 1.0)
+    Generate reservoir water level time series.
     """
 
     # --------------------------------------------------
@@ -27,14 +16,13 @@ def generate_altimetry_timeseries(
     import numpy as np
     import pandas as pd
     import geopandas as gpd
+    import shapely
     import ee, geemap
-    from datetime import datetime, timedelta, UTC
-    from skimage.filters import threshold_otsu
 
     from .altimetry_extractors import extract_altimetry_data
 
     # --------------------------------------------------
-    # CLASS PARSER (STRICT)
+    # CLASS PARSER
     # --------------------------------------------------
     def parse_reservoir_class(res_class):
         if res_class is None:
@@ -43,21 +31,40 @@ def generate_altimetry_timeseries(
             raise ValueError(f"Invalid reservoir_class: {res_class}")
         return int(res_class[0]), res_class[1]
 
+    original_class = reservoir_class
     base_class, terrain_flag = parse_reservoir_class(reservoir_class)
 
+    degraded = False
     use_s1 = base_class in [3, 4]
-    buffer_m = -300 if base_class in [1, 2] else 0
+    buffer_m = -1000 if base_class in [1, 2] else 0
 
     # --------------------------------------------------
-    # HELPERS
+    # GEOMETRY HELPERS
     # --------------------------------------------------
-    def buffer_gdf(gdf, buffer_m):
+    def clean_gdf(gdf):
+        gdf = gdf[gdf.geometry.notnull()]
+        gdf["geometry"] = gdf.geometry.buffer(0)
+        gdf = gdf[gdf.is_valid & ~gdf.is_empty]
+        return gdf
+
+    def safe_union_geoms(geoms):
+        geoms = [g.buffer(0) for g in geoms if g and g.is_valid and not g.is_empty]
+        if not geoms:
+            return None
+        try:
+            return shapely.union_all(geoms)
+        except Exception:
+            return None
+
+    def buffer_gdf_safe(gdf, buffer_m):
         g = gdf.to_crs(3857)
-        g["geometry"] = g.geometry.buffer(buffer_m)
-        g = g[~g.is_empty]
+        g["geometry"] = g.geometry.buffer(buffer_m).buffer(0)
+        g = g[g.is_valid & ~g.is_empty]
         return g.to_crs(4326)
 
-    # -------- GLOBAL MAD FILTER --------
+    # --------------------------------------------------
+    # FILTER HELPERS
+    # --------------------------------------------------
     def mad_outlier_removal(df, column, threshold=2.0):
         if df.empty:
             return df
@@ -68,33 +75,18 @@ def generate_altimetry_timeseries(
         z = 0.6745 * (df[column] - med) / mad
         return df[np.abs(z) <= threshold]
 
-    # -------- TIME-BASED ROLLING IQR --------
-    def rolling_iqr_outlier_removal(
-        df,
-        column,
-        time_window="90D",
-        threshold_multiplier=1.0,
-    ):
+    def rolling_iqr_outlier_removal(df, column, time_window="90D", threshold_multiplier=1.0):
         if df.empty:
             return df
-
-        Q1 = df[column].rolling(
-            window=time_window, center=True, min_periods=3
-        ).quantile(0.25)
-
-        Q3 = df[column].rolling(
-            window=time_window, center=True, min_periods=3
-        ).quantile(0.75)
-
+        Q1 = df[column].rolling(window=time_window, center=True, min_periods=3).quantile(0.25)
+        Q3 = df[column].rolling(window=time_window, center=True, min_periods=3).quantile(0.75)
         IQR = Q3 - Q1
         lower = Q1 - threshold_multiplier * IQR
         upper = Q3 + threshold_multiplier * IQR
-
-        mask = (df[column] >= lower) & (df[column] <= upper)
-        return df[mask]
+        return df[(df[column] >= lower) & (df[column] <= upper)]
 
     # --------------------------------------------------
-    # MEDIAN POINT COMPUTATION (PER PASS)
+    # MEDIAN POINT PER PASS
     # --------------------------------------------------
     def compute_median_point(df):
         if df.empty or "range" not in df.columns:
@@ -117,8 +109,9 @@ def generate_altimetry_timeseries(
                 df["altitude"]
                 - (
                     df["range"]
-                    + df["dry"] + df["wet"] + df["pole"]
-                    + df["solid"] + df["iono"] + df["load_tide"]
+                    + df["dry"] + df["wet"]
+                    + df["pole"] + df["solid"]
+                    + df["iono"] + df["load_tide"]
                 )
                 - df["geoid"]
             )
@@ -128,7 +121,8 @@ def generate_altimetry_timeseries(
                 - (
                     df["range"]
                     + df["dry"] + df["wet"]
-                    + df["pole"] + df["solid"] + df["iono"]
+                    + df["pole"] + df["solid"]
+                    + df["iono"]
                 )
                 - df["geoid"]
             )
@@ -151,49 +145,7 @@ def generate_altimetry_timeseries(
         }
 
     # --------------------------------------------------
-    # SENTINEL-1 MASK
-    # --------------------------------------------------
-    def sentinel1_mask(region_ee, target_date):
-        coll = (
-            ee.ImageCollection("COPERNICUS/S1_GRD")
-            .filterBounds(region_ee)
-            .filter(ee.Filter.eq("instrumentMode", "IW"))
-            .filter(ee.Filter.listContains(
-                "transmitterReceiverPolarisation", "VV"
-            ))
-            .select("VV")
-        )
-
-        coll = coll.filterDate(
-            ee.Date(target_date - timedelta(days=s1_search_days)),
-            ee.Date(target_date + timedelta(days=s1_search_days))
-        )
-
-        if coll.size().getInfo() == 0:
-            return None
-
-        imgs = coll.toList(coll.size()).getInfo()
-        times = np.array([i["properties"]["system:time_start"] for i in imgs])
-        idx = np.argmin(np.abs(times - target_date.timestamp() * 1000))
-        nearest = datetime.fromtimestamp(times[idx] / 1000, tz=UTC)
-
-        img = (
-            coll
-            .filterDate(nearest.strftime("%Y-%m-%d"),
-                        (nearest + timedelta(days=1)).strftime("%Y-%m-%d"))
-            .mosaic()
-            .focal_median(1)
-        )
-
-        arr = np.array(img.sampleRectangle(region=region_ee).get("VV").getInfo())
-        arr = arr[np.isfinite(arr)]
-        if arr.size == 0:
-            return None
-
-        return img.lt(threshold_otsu(arr))
-
-    # --------------------------------------------------
-    # INITIALIZE EE
+    # INIT EE
     # --------------------------------------------------
     try:
         ee.Initialize()
@@ -201,12 +153,29 @@ def generate_altimetry_timeseries(
         ee.Authenticate()
         ee.Initialize()
 
-    buffered_max = buffer_gdf(max_gdf, buffer_m)
-    max_union = buffered_max.geometry.union_all()
-    region_ee = geemap.geopandas_to_ee(buffered_max)
+    # --------------------------------------------------
+    # GEOMETRY PREPARATION WITH DEGRADATION
+    # --------------------------------------------------
+    max_gdf = clean_gdf(max_gdf)
+    buffered_max = buffer_gdf_safe(max_gdf, buffer_m)
+    max_union = safe_union_geoms(buffered_max.geometry)
+
+    if max_union is None or max_union.is_empty:
+        if buffer_m < 0:
+            print("[INFO] No geometry after negative buffer — degrading to class 3/4")
+            degraded = True
+            buffer_m = 0
+            use_s1 = True
+
+            buffered_max = buffer_gdf_safe(max_gdf, buffer_m)
+            max_union = safe_union_geoms(buffered_max.geometry)
+
+        if max_union is None or max_union.is_empty:
+            print("[WARN] Geometry invalid even after degradation — skipping reservoir")
+            return None
 
     # --------------------------------------------------
-    # MAIN LOOP (PER PASS)
+    # MAIN LOOP
     # --------------------------------------------------
     records = []
 
@@ -223,54 +192,34 @@ def generate_altimetry_timeseries(
         gdf = gpd.GeoDataFrame(
             df,
             geometry=gpd.points_from_xy(df.longitude, df.latitude),
-            crs="EPSG:4326"
+            crs="EPSG:4326",
         )
 
-        # --- STEP 1: Max-extent filtering ---
-        gdf = gdf[gdf.geometry.within(max_union)]
-        if gdf.empty:
+        gdf_in = gdf[gdf.geometry.within(max_union)]
+
+        if gdf_in.empty and buffer_m < 0:
+            print("[INFO] Track missed buffered geometry — degrading to class 3/4")
+            degraded = True
+
+            buffered_max_fb = buffer_gdf_safe(max_gdf, 0)
+            max_union_fb = safe_union_geoms(buffered_max_fb.geometry)
+            if max_union_fb is None or max_union_fb.is_empty:
+                continue
+
+            gdf_in = gdf[gdf.geometry.within(max_union_fb)]
+
+        if gdf_in.empty:
             continue
 
-        # --- STEP 2: Sentinel-1 masking (Class 3–4 only) ---
-        if use_s1:
-            mask = sentinel1_mask(
-                region_ee,
-                pd.to_datetime(gdf["date"].iloc[0])
-            )
-            if mask is None:
-                continue
-
-            fc = mask.sampleRegions(
-                geemap.geopandas_to_ee(gdf),
-                scale=30,
-                geometries=True
-            )
-            if fc.size().getInfo() == 0:
-                continue
-
-            sampled = geemap.ee_to_gdf(fc)
-            band = next(
-                (c for c in sampled.columns
-                 if c not in ("geometry", "system:index", "id")),
-                None
-            )
-            if band is None:
-                continue
-
-            gdf = sampled[sampled[band].astype(bool)]
-            if gdf.empty:
-                continue
-
-        # --- STEP 3: Per-pass median ---
-        rep = compute_median_point(gdf.drop(columns="geometry"))
+        rep = compute_median_point(gdf_in.drop(columns="geometry"))
         if rep:
             records.append(rep)
 
     if not records:
-        raise RuntimeError("No valid time-series points produced.")
+        return None
 
     # --------------------------------------------------
-    # FINAL TIME SERIES + FILTERING
+    # FINAL FILTERING
     # --------------------------------------------------
     ts = (
         pd.DataFrame(records)
@@ -279,17 +228,22 @@ def generate_altimetry_timeseries(
         .set_index("date")
     )
 
-    # --- Global MAD ---
-    ts = mad_outlier_removal(ts, column="elevation", threshold=2.0)
-
-    # --- Rolling IQR (time-based) ---
-    ts = rolling_iqr_outlier_removal(
-        ts,
-        column="elevation",
-        time_window="90D",
-        threshold_multiplier=1.0
-    )
+    ts = mad_outlier_removal(ts, "elevation", 2.0)
+    ts = rolling_iqr_outlier_removal(ts, "elevation")
 
     ts = ts.reset_index()
     ts.to_csv(output_csv, index=False, float_format="%.3f")
-    return ts
+
+    # --------------------------------------------------
+    # FINAL CLASS UPDATE
+    # --------------------------------------------------
+    final_class = reservoir_class
+    if degraded:
+        final_class = f"3{terrain_flag}"
+
+    return {
+        "timeseries": ts,
+        "reservoir_class": final_class,
+        "original_class": original_class,
+        "degraded": degraded,
+    }

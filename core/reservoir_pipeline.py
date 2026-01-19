@@ -55,7 +55,7 @@ def run_reservoir_analysis(
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
 
     # --------------------------------------------------
-    # STEP 1: Water masks (AOI-BASED)
+    # STEP 1: Water masks (AOI-based)
     # --------------------------------------------------
     perm_gdf, max_gdf = water_masks(
         aoi_gdf=aoi_gdf,
@@ -64,10 +64,11 @@ def run_reservoir_analysis(
     )
 
     if perm_gdf.empty or max_gdf.empty:
-        raise RuntimeError("Water mask extraction failed (empty result)")
+        print("⏭️  Skipping reservoir — empty water masks")
+        return None
 
     # --------------------------------------------------
-    # STEP 2: Reservoir classification
+    # STEP 2: Initial reservoir classification
     # --------------------------------------------------
     reservoir_class, class_metrics = run_full_classification(
         base_folder=altimetry_folder,
@@ -75,21 +76,42 @@ def run_reservoir_analysis(
         perm_water_input=perm_gdf,
     )
 
+    if reservoir_class is None:
+        print("⏭️  Skipping reservoir — no max-extent intersection")
+        return None
+
     # --------------------------------------------------
     # STEP 3: Generate altimetry time series
+    # (may degrade reservoir class)
     # --------------------------------------------------
-    ts_df = generate_altimetry_timeseries(
+    ts_result = generate_altimetry_timeseries(
         nc_folder=altimetry_folder,
         max_gdf=max_gdf,
         reservoir_class=reservoir_class,
         output_csv=output_csv,
     )
 
+    if ts_result is None:
+        print("⏭️  Skipping reservoir — no valid altimetry time series")
+        return None
+
+    # Unpack time-series results
+    ts_df = ts_result["timeseries"]
+
+    # IMPORTANT: propagate degraded class if applicable
+    final_class = ts_result["reservoir_class"]
+
+    if ts_result.get("degraded", False):
+        print(
+            f"⚠️  Reservoir class degraded: "
+            f"{ts_result['original_class']} → {final_class}"
+        )
+
     # --------------------------------------------------
     # Return results
     # --------------------------------------------------
     return {
-        "reservoir_class": reservoir_class,
+        "reservoir_class": final_class,
         "classification_metrics": class_metrics,
         "output_csv": output_csv,
         "timeseries": ts_df,

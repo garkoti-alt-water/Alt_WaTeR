@@ -14,6 +14,11 @@ from scipy.interpolate import interp1d
 import ee
 import geemap
 
+import zipfile
+import tempfile
+import shutil
+
+
 # ----------------- HELPERS -----------------
 def interpolate_1hz_to_20hz(data_1hz, time_1hz, time_20hz):
     """Interpolate 1Hz -> 20Hz safely (handles masked arrays & NaNs)."""
@@ -26,6 +31,36 @@ def interpolate_1hz_to_20hz(data_1hz, time_1hz, time_20hz):
     f = interp1d(time_1hz[mask], data_1hz[mask], kind="linear", bounds_error=False, fill_value="extrapolate")
     return f(time_20hz)
 
+def extract_s3_zip(zip_path):
+    """
+    Extract a Sentinel-3 .SEN3.zip to a temporary directory
+    and return path to enhanced_measurement.nc
+    """
+    
+    tmpdir = tempfile.mkdtemp(prefix="s3_")
+
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(tmpdir)
+
+    
+    sen3_dirs = glob.glob(os.path.join(tmpdir, "*.SEN3"))
+    if not sen3_dirs:
+        shutil.rmtree(tmpdir)
+        raise RuntimeError(f"[S3] ERROR: No .SEN3 directory found inside ZIP")
+
+    sen3_dir = sen3_dirs[0]
+    
+
+    nc_path = os.path.join(sen3_dir, "enhanced_measurement.nc")
+    if not os.path.exists(nc_path):
+       
+        
+        shutil.rmtree(tmpdir)
+        raise RuntimeError("[S3] ERROR: enhanced_measurement.nc not found")
+
+   
+    return nc_path, tmpdir
+
 def try_vars(ds, candidates):
     """Return first existing variable array from candidates or raise KeyError."""
     for name in candidates:
@@ -34,43 +69,28 @@ def try_vars(ds, candidates):
     raise KeyError(f"None of candidate variable names found: {candidates}")
 
 def discover_altimetry_files(base_folder):
-    """
-    Discover altimetry files safely:
-      - Sentinel-3 → ONLY *.SEN3/enhanced_measurement.nc
-      - Jason-3 / Sentinel-6 / SWOT → all other *.nc
-    """
     files = []
 
-    # ---------- Sentinel-3 (enhanced ONLY) ----------
-    s3_enhanced = glob.glob(
-        os.path.join(base_folder, "**/*.SEN3/enhanced_measurement.nc"),
-        recursive=True
-    )
-    files.extend(s3_enhanced)
-
-    # ---------- Other missions ----------
-    other_nc = glob.glob(
-        os.path.join(base_folder, "**/*.nc"),
-        recursive=True
+    # Sentinel-3 ZIP
+    files.extend(
+        glob.glob(os.path.join(base_folder, "**/*.SEN3.zip"), recursive=True)
     )
 
-    for f in other_nc:
+    # Sentinel-3 extracted
+    files.extend(
+        glob.glob(
+            os.path.join(base_folder, "**/*.SEN3/enhanced_measurement.nc"),
+            recursive=True,
+        )
+    )
+
+    # Other missions
+    for f in glob.glob(os.path.join(base_folder, "**/*.nc"), recursive=True):
         fl = f.lower()
-
-        # skip Sentinel-3 junk completely
         if ".sen3/" in fl:
             continue
-
-        # skip obvious non-altimetry files
-        if any(x in fl for x in [
-            "standard_measurement",
-            "calibration",
-            "aux",
-            "noise",
-            "manifest",
-        ]):
+        if any(x in fl for x in ["standard_measurement", "calibration", "aux", "noise"]):
             continue
-
         files.append(f)
 
     return sorted(set(files))
@@ -78,90 +98,60 @@ def discover_altimetry_files(base_folder):
 
 # ----------------- EXTRACTORS -----------------
 def extract_sentinel3_data(nc_path):
-    """Extract Sentinel-3 (enhanced or standard) variables robustly."""
     ds = Dataset(nc_path, "r")
     fname = os.path.basename(nc_path)
     parent = os.path.basename(os.path.dirname(nc_path)).upper()
-    mission = "S3A" if "S3A" in parent or "S3A" in fname.upper() else "S3B" if "S3B" in parent or "S3B" in fname.upper() else "S3"
 
-    # --- UPDATED DATE LOGIC ---
-    # date from equator_time attribute when present
-    file_date = pd.NaT  # Default to Not-a-Time
+    mission = (
+        "S3A" if "S3A" in parent or "S3A" in fname.upper()
+        else "S3B" if "S3B" in parent or "S3B" in fname.upper()
+        else "S3"
+    )
+
+    file_date = pd.NaT
     if hasattr(ds, "equator_time"):
         try:
-            date_s31 = ds.equator_time.split("T")[0]
-            file_date = datetime.strptime(date_s31, "%Y-%m-%d")
-        except Exception as e:
-            print(f"Warning: S3 file {fname} - could not parse equator_time '{ds.equator_time}'. Error: {e}")
-            pass # file_date remains pd.NaT
-    else:
-        print(f"Warning: S3 file {fname} has no 'equator_time' attribute. Date will be NaT.")
-    # --- END UPDATED DATE LOGIC ---
+            file_date = datetime.strptime(ds.equator_time.split("T")[0], "%Y-%m-%d")
+        except Exception:
+            pass
 
-    # required 20Hz variables
-    try:
-        lats = try_vars(ds, ["lat_20_ku", "latitude", "lat"])
-        lons_raw = try_vars(ds, ["lon_20_ku", "longitude", "lon"])
-        lons = np.where(lons_raw > 180, lons_raw - 360, lons_raw)
-        tims = try_vars(ds, ["time_20_ku", "time_20", "time20", "time"])
-        rng = try_vars(ds, ["range_ocog_20_ku", "range_ocog_20", "range_ocog", "range"])
-        alt = try_vars(ds, ["alt_20_ku", "altitude", "alt"])
-    except KeyError as e:
-        ds.close()
-        raise RuntimeError(f"Sentinel-3: missing core variable: {e}")
+    lats = try_vars(ds, ["lat_20_ku", "latitude", "lat"])
+    lons_raw = try_vars(ds, ["lon_20_ku", "longitude", "lon"])
+    lons = np.where(lons_raw > 180, lons_raw - 360, lons_raw)
+    tims = try_vars(ds, ["time_20_ku", "time_20", "time"])
+    rng = try_vars(ds, ["range_ocog_20_ku", "range_ocog", "range"])
+    alt = try_vars(ds, ["alt_20_ku", "altitude", "alt"])
 
-    # optional 1Hz arrays
     def get_1hz(names):
         try:
             return try_vars(ds, names)
         except KeyError:
             return None
 
-    pole_1hz = get_1hz(["pole_tide_01", "pole_tide"])
-    solid_1hz = get_1hz(["solid_earth_tide_01", "solid_earth_tide"])
-    iono_1hz = get_1hz(["iono_cor_gim_01_ku", "iono_cor_gim"])
-    geoid_1hz = get_1hz(["geoid_01", "geoid"])
-    dry_1hz = get_1hz(["mod_dry_tropo_cor_meas_altitude_01", "mod_dry_tropo_cor_meas_altitude"])
-    wet_1hz = get_1hz(["mod_wet_tropo_cor_meas_altitude_01", "mod_wet_tropo_cor_meas_altitude"])
-    load_1hz = get_1hz(["load_tide_sol1_01", "load_tide"])
-
-    # t1 timeline for 1Hz
-    try:
-        t1 = try_vars(ds, ["time_01", "time_1hz", "time_01_ku", "time_01_20"])
-    except KeyError:
-        t1 = None
-
-    def interp_or_nan(arr1hz):
-        return interpolate_1hz_to_20hz(arr1hz, t1, tims) if (arr1hz is not None and t1 is not None) else np.full_like(tims, np.nan, dtype=float)
-
-    pole = interp_or_nan(pole_1hz)
-    solid = interp_or_nan(solid_1hz)
-    iono = interp_or_nan(iono_1hz)
-    geoid = interp_or_nan(geoid_1hz)
-    dry = interp_or_nan(dry_1hz)
-    wet = interp_or_nan(wet_1hz)
-    load = interp_or_nan(load_1hz)
+    t1 = get_1hz(["time_01", "time_1hz"])
+    pole = interpolate_1hz_to_20hz(get_1hz(["pole_tide"]), t1, tims) if t1 is not None else np.nan
+    solid = interpolate_1hz_to_20hz(get_1hz(["solid_earth_tide"]), t1, tims) if t1 is not None else np.nan
+    iono = interpolate_1hz_to_20hz(get_1hz(["iono_cor_gim"]), t1, tims) if t1 is not None else np.nan
+    geoid = interpolate_1hz_to_20hz(get_1hz(["geoid"]), t1, tims) if t1 is not None else np.nan
 
     ds.close()
 
     df = pd.DataFrame({
         "mission": mission,
-        "date": file_date,
+        "date": pd.to_datetime(file_date),
         "latitude": lats,
         "longitude": lons,
         "time_20hz": tims,
         "altitude": alt,
         "range": rng,
-        "dry": dry,
-        "wet": wet,
         "pole": pole,
         "solid": solid,
         "iono": iono,
         "geoid": geoid,
-        "load_tide": load,
     })
-    df['date'] = pd.to_datetime(df['date']) # Ensure column is datetime type
+
     return df
+
 
 def extract_jason3_or_s6_data(nc_path):
     """Jason-3 / Sentinel-6 extractor (typical structure)."""
@@ -402,12 +392,18 @@ def extract_sentinel6_data(nc_path):
 
 
 def extract_altimetry_data(nc_path):
-    """
-    Mission-aware extractor (STRICT & SAFE)
-    """
     f = nc_path.lower()
 
-    # ---------- Sentinel-3 ----------
+    # ---------- Sentinel-3 ZIP ----------
+    if f.endswith(".sen3.zip"):
+        nc_file, tmpdir = extract_s3_zip(nc_path)
+        try:
+            df = extract_sentinel3_data(nc_file)
+        finally:
+            shutil.rmtree(tmpdir)
+        return df
+
+    # ---------- Sentinel-3 (already extracted) ----------
     if f.endswith("enhanced_measurement.nc"):
         return extract_sentinel3_data(nc_path)
 
