@@ -4,9 +4,8 @@ from pathlib import Path
 
 import streamlit as st
 import geopandas as gpd
+import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
-from matplotlib.lines import Line2D
 from shapely.geometry import box, shape
 
 import folium
@@ -113,7 +112,10 @@ if aoi_mode == "Bounding box":
             float(min_lon), float(min_lat),
             float(max_lon), float(max_lat),
         )
-        aoi_gdf = gpd.GeoDataFrame(geometry=[bbox_geom], crs="EPSG:4326")
+        aoi_gdf = gpd.GeoDataFrame(
+            geometry=[bbox_geom],
+            crs="EPSG:4326"
+        )
 
 # -------------------------------------------------
 # Polygon draw
@@ -139,7 +141,10 @@ if aoi_mode == "Draw polygon":
 
     if drawings:
         geom = shape(drawings[0]["geometry"])
-        aoi_gdf = gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326")
+        aoi_gdf = gpd.GeoDataFrame(
+            geometry=[geom],
+            crs="EPSG:4326"
+        )
 
 # -------------------------------------------------
 # Inputs
@@ -151,15 +156,23 @@ output_csv = st.text_input("Output CSV file")
 run = st.button("Run analysis")
 
 # -------------------------------------------------
-# Run
+# Run pipeline
 # -------------------------------------------------
 if run:
+    if aoi_gdf is None:
+        st.error("Please define an area of interest.")
+        st.stop()
+
     with st.spinner("Processing altimetry data..."):
         result = run_reservoir_analysis(
             aoi_gdf=aoi_gdf,
             altimetry_folder=altimetry_folder,
             output_csv=output_csv,
         )
+
+    if result is None:
+        st.warning("No valid altimetry tracks intersect the reservoir.")
+        st.stop()
 
     st.session_state.result = result
     st.session_state.analysis_done = True
@@ -170,35 +183,69 @@ if run:
 if st.session_state.analysis_done:
 
     result = st.session_state.result
-    ts_df = result["timeseries"]
+
+    median_csv = result["timeseries"]["reservoir_median"]
     perm_gdf = result["perm_gdf"]
     max_gdf = result["max_gdf"]
     reservoir_class = result["reservoir_class"]
+
+    if not os.path.exists(median_csv):
+        st.error("Median time series CSV not found.")
+        st.stop()
+
+    ts_df = pd.read_csv(median_csv, parse_dates=["date"])
+
+    if ts_df.empty:
+        st.warning("Median time series is empty after filtering.")
+        st.stop()
 
     class_color = get_class_color(reservoir_class)
 
     st.success("Processing complete.")
     st.caption(f"Reservoir class: **{reservoir_class}**")
 
-    # Time series
+    # -------------------------------------------------
+    # Time series plot
+    # -------------------------------------------------
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.scatter(ts_df["date"], ts_df["elevation"], color=class_color, s=14)
+    ax.scatter(
+        ts_df["date"],
+        ts_df["elevation"],
+        color=class_color,
+        s=14
+    )
     ax.set_xlabel("Date")
     ax.set_ylabel("Water level (m)")
     ax.grid(alpha=0.3)
     st.pyplot(fig)
 
-    # Map
+    # -------------------------------------------------
+    # Map plot
+    # -------------------------------------------------
     fig, ax = plt.subplots(figsize=(6.5, 6.5))
     perm_gdf.plot(ax=ax, facecolor="blue", alpha=0.9)
     max_gdf.plot(ax=ax, facecolor="lightblue", alpha=0.9)
 
     gpd.GeoDataFrame(
         ts_df,
-        geometry=gpd.points_from_xy(ts_df.longitude, ts_df.latitude),
+        geometry=gpd.points_from_xy(
+            ts_df.longitude,
+            ts_df.latitude
+        ),
         crs="EPSG:4326",
     ).plot(ax=ax, color=class_color, markersize=4)
 
     ax.set_title(f"Reservoir class {reservoir_class}")
     ax.grid(alpha=0.3)
     st.pyplot(fig)
+
+    # -------------------------------------------------
+    # Download
+    # -------------------------------------------------
+    with open(median_csv, "rb") as f:
+        st.download_button(
+            label="Download median time series CSV",
+            data=f,
+            file_name=os.path.basename(median_csv),
+            mime="text/csv",
+        )
