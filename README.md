@@ -1,6 +1,6 @@
 # Alt-WaTeR
 
-**Water level Time series generation for Reservoirs using satellite Altimetry**
+**Water level Time series for Reservoirs using satellite Altimetry**
 
 ---
 
