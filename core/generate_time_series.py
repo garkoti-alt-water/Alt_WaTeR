@@ -172,7 +172,7 @@ def generate_altimetry_timeseries(
             - df["geoid"]
         )
 
-        df = df.dropna(subset=["elevation", "latitude", "longitude", "date"])
+        df = df.dropna(subset=["elevation", "latitude", "longitude", "date","cycle"])
 
         gdf = gpd.GeoDataFrame(
             df,
@@ -214,15 +214,30 @@ def generate_altimetry_timeseries(
 
         # ---------------- Median time series ----------------
         med = gdf["elevation"].median()
+
+        # Step 2: Find observed point closest to median
         idx = (gdf["elevation"] - med).abs().idxmin()
         pt = gdf.loc[idx]
+
+        # Step 3: Representative observed elevation (raw measurement)
+        e_rep = pt["elevation"]
+
+        # Step 4: Standard deviation relative to representative elevation
+        std_rep = np.std(gdf["elevation"] - e_rep, ddof=1)
 
         ts_median.append({
             "mission": mission,
             "date": date,
-            "elevation": med,
+            "cycle":pt["cycle"],
+
+            # ✅ Use representative elevation, not the median value
+            "elevation": e_rep,
+
+            # Representative coordinates
             "latitude": pt["latitude"],
             "longitude": pt["longitude"],
+
+            "uncertainty": std_rep,
         })
 
     # --------------------------------------------------

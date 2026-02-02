@@ -33,6 +33,50 @@ def try_vars(ds, candidates):
             return ds.variables[name][:]
     raise KeyError(f"None of candidate variable names found: {candidates}")
 
+import re
+import numpy as np
+
+def extract_cycle(fname, mission):
+    """
+    Mission-specific cycle extraction.
+    Returns cycle string with leading zeros preserved.
+    """
+
+    try:
+        parts = fname.split("_")
+
+        # ---------------- Jason-3 ----------------
+        # JA3_GPS_2PfP033_052_20170101...
+        if mission == "JA3":
+            token = parts[2]              # "2PfP001"
+            match = re.search(r"(\d{3})$", token)
+            if match:
+                return match.group(1)    
+
+        # ---------------- SWOT ----------------
+        # SWOT_GPS_2PfP001_079_20230724...
+        if mission == "SWOT":
+            token = parts[2]              # "2PfP001"
+            match = re.search(r"(\d{3})$", token)
+            if match:
+                return match.group(1)    
+
+        # ---------------- Sentinel-6 ----------------
+        # S6A_P4_2__HR_STD__NT_084_052_20230220...
+        if mission.startswith("S6"):
+            return fname.split('_')[10]
+
+        # ---------------- Sentinel-3 ----------------
+        # S3A_SR_2_LAN_HY_..._2165_013_010...
+        if mission.startswith("S3"):
+            return parts[9]   # "013"
+
+    except Exception:
+        return np.nan
+
+    return np.nan
+
+
 def discover_altimetry_files(base_folder):
     """
     Discover altimetry files safely:
@@ -147,6 +191,7 @@ def extract_sentinel3_data(nc_path):
     df = pd.DataFrame({
         "mission": mission,
         "date": file_date,
+        "cycle":extract_cycle(os.path.basename(os.path.dirname(nc_path)),mission),
         "latitude": lats,
         "longitude": lons,
         "time_20hz": tims,
@@ -208,6 +253,7 @@ def extract_jason3_or_s6_data(nc_path):
         df = pd.DataFrame({
         "mission": mission,
         "date": file_date,
+        "cycle":extract_cycle(fname,mission),
         "latitude": lats,
         "longitude": lons,
         "time_20hz": t20,
@@ -319,8 +365,9 @@ def extract_swot_data(nc_path):
     ds.close()
             
     df = pd.DataFrame({
-        'mission': 'SWOT', # Set mission as SWOT
+        'mission': 'SWOT', 
         'date': file_date,
+        "cycle":extract_cycle(os.path.basename(nc_path),mission),
         'latitude': lats, 
         'longitude': lons, 
         'time_20hz': tims, # Harmonized name
@@ -384,6 +431,7 @@ def extract_sentinel6_data(nc_path):
     df = pd.DataFrame({
         "mission": mission,
         "date": file_date,
+        "cycle":extract_cycle(fname,mission),
         "latitude": lats,
         "longitude": lons,
         "time_20hz": tims,
