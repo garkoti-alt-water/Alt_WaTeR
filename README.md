@@ -153,11 +153,13 @@ The output CSV path must correspond to a writable location on the local system.
 
 The output CSV file contains one record per satellite pass with the following fields:
 
-* mission
 * date
-* elevation
+* mission
+* cycle
 * latitude
 * longitude
+* elevation
+* uncertainty
 
 ### Figures
 
